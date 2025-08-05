@@ -1763,3 +1763,156 @@ def adapt_fewshot(adapt_root,
 </code></pre>
 
 </details>
+<details>
+<summary>Contributors (click to expand)</summary>
+
+<pre><code class="language-python">
+# ================================================================
+# SECTION 1 · Text-Only Baseline (organiser MiniLM-L6 + fine-tune)
+# ---------------------------------------------------------------
+#  • load_icon_db()            → {id: description}
+#  • encode_choices()          caches choice vectors
+#  • guess_words(hints, opts)  returns top-10 prediction list
+#  • fine_tune_20()            one-pass cosine-loss fine-tune on 20 val rounds
+# ================================================================
+
+from sentence_transformers import SentenceTransformer, SentencesDataset, InputExample, losses, util
+import torch, json, math, random
+from pathlib import Path
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+BASE_MODEL = 'sentence-transformers/all-MiniLM-L6-v2'
+EMB_DIM    = 384
+TOP_K      = 10
+
+# ---------- 0.  icon DB ----------
+def load_icon_db(path="icon_descriptions.json"):
+    return json.loads(Path(path).read_text())
+
+ICON_DB = load_icon_db()            # {id: "A red apple …"}
+
+# ---------- 1.  encoder + cache ----------
+text_encoder = SentenceTransformer(BASE_MODEL, device=device)
+_choice_cache = {}
+def encode_choices(choices):
+    miss = [c for c in choices if c not in _choice_cache]
+    if miss:
+        vecs = text_encoder.encode([f"A {x}" for x in miss],
+                                   convert_to_tensor=True, show_progress_bar=False)
+        for k,v in zip(miss, vecs):
+            _choice_cache[k] = v / v.norm()
+    return torch.stack([_choice_cache[c] for c in choices]).to(device)   # (N,384)
+
+# ---------- 2.  hint prompt builder ----------
+def hints_to_sentence(hints):
+    # preserves order; works for 1–5 hints
+    return " -> ".join([ICON_DB[h]['description'].lower() for h in hints])
+
+# ---------- 3.  main guesser ----------
+def guess_words(hints: list[int], choices: list[str]) -> list[str]:
+    q   = hints_to_sentence(hints)
+    qv  = text_encoder.encode(q, convert_to_tensor=True).to(device)
+    qv  = qv / qv.norm()
+    cv  = encode_choices(choices)                     # (N,384)
+    sims= (qv @ cv.T).cpu()                           # (N,)
+    top = sims.topk(TOP_K).indices
+    return [choices[i] for i in top]
+
+# ---------- 4.  optional fine-tune on 20 validation rounds ----------
+def fine_tune_20(val_path="takehome_validation.json"):
+    data  = json.loads(Path(val_path).read_text())
+    rand  = random.Random(42)
+    train = []
+    for row in data:
+        hints = [h for h in row['hints'] if h in ICON_DB]
+        sent  = hints_to_sentence(hints)
+        pos   = row['label']
+        neg   = rand.choice([c for c in row['options'] if c != pos])
+        train.append(InputExample(texts=[sent, f"A {pos}"], label=1.0))
+        train.append(InputExample(texts=[sent, f"A {neg}"], label=0.0))
+    ds   = SentencesDataset(train, text_encoder)
+    loader = torch.utils.data.DataLoader(ds, shuffle=True, batch_size=8)
+    loss   = losses.CosineSimilarityLoss(text_encoder)
+    text_encoder.fit(train_objectives=[(loader, loss)],
+                     epochs=1, warmup_steps=10)
+    print("⇒ Mini fine-tune done.")
+# ================================================================
+# SECTION 2 · CLIP Fusion (icons + descriptions) — Weather-team V2
+# ---------------------------------------------------------------
+#  • build_dataloaders()    loads 64×64 icon PNG + description
+#  • train_clip_contrast() fine-tunes ViT-B/32 for 30 epochs
+#  • clip_guess(hints, opts, α=0.5)  ranks by α·image+ (1-α)·text
+# ================================================================
+
+import os, torch, torch.nn.functional as F
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
+
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'   # mainland mirror
+device   = 'cuda' if torch.cuda.is_available() else 'cpu'
+clip_name= 'openai/clip-vit-base-patch16'
+clipM    = CLIPModel.from_pretrained(clip_name).to(device)
+proc     = CLIPProcessor.from_pretrained(clip_name)
+
+# ---------- 1.  dataset ----------
+class IconSet(torch.utils.data.Dataset):
+    def __init__(self, icon_db):
+        self.ids  = sorted(icon_db)
+        self.desc = [f"an icon showing {icon_db[i]['description'].replace('\n',' and ')}"
+                     for i in self.ids]
+        self.imgs = [icon_db[i]['icons'] for i in self.ids]  # PIL 64×64
+    def __len__(self): return len(self.ids)
+    def __getitem__(self, i): return self.imgs[i], self.desc[i]
+
+def build_dataloaders(batch=32):
+    ds = IconSet(ICON_DB)
+    def collate(batch):
+        imgs, txts = zip(*batch)
+        enc = proc(images=list(imgs), text=list(txts), return_tensors='pt',
+                   padding=True, truncation=True)
+        return {k: v.to(device) for k,v in enc.items()}
+    return torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=True,
+                                       collate_fn=collate)
+
+# ---------- 2.  contrastive fine-tune ----------
+def train_clip_contrast(epochs=30, lr=5e-5):
+    clipM.train(); opt = torch.optim.AdamW(clipM.parameters(), lr=lr)
+    loader = build_dataloaders()
+    for ep in range(epochs):
+        tot = 0
+        for batch in loader:
+            opt.zero_grad()
+            out = clipM(**batch)
+            ie, te = F.normalize(out.image_embeds, p=2, dim=1), \
+                     F.normalize(out.text_embeds,  p=2, dim=1)
+            sim   = (ie @ te.T) * clipM.logit_scale.exp()
+            tgt   = torch.arange(sim.size(0), device=device)
+            loss  = (F.cross_entropy(sim, tgt) + F.cross_entropy(sim.T, tgt)) / 2
+            loss.backward(); opt.step()
+            tot += loss.item()
+        if ep % 5 == 0: print(f"ep{ep:02d}  loss {tot/len(loader):.4f}")
+    clipM.eval(); clipM.save_pretrained("./clip_ft"); proc.save_pretrained("./clip_ft")
+
+# ---------- 3.  retrieval helper ----------
+def clip_guess(hints, choices, alpha=0.5):
+    # encode hints → imgs + desc
+    imgs = [ICON_DB[h]['icons'] for h in hints]
+    desc = [f"an icon showing {ICON_DB[h]['description'].replace('\n',' and ')}"
+            for h in hints]
+    enc_h = proc(images=imgs, text=desc, return_tensors='pt',
+                 padding=True, truncation=True).to(device)
+    enc_c = proc(text=[f"a {c}" for c in choices], return_tensors='pt',
+                 padding=True, truncation=True).to(device)
+
+    with torch.no_grad():
+        ih = F.normalize(clipM.get_image_features(**enc_h), p=2, dim=1)
+        th = F.normalize(clipM.get_text_features(**enc_h),  p=2, dim=1)
+        tc = F.normalize(clipM.get_text_features(**enc_c),  p=2, dim=1)
+        sim = alpha * (ih @ tc.T) + (1-alpha) * (th @ tc.T)
+        score = sim.sum(0)
+        top = score.topk(10).indices.cpu()
+    return [choices[i] for i in top]
+
+</code></pre>
+
+</details>
