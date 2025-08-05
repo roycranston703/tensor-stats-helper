@@ -781,3 +781,985 @@ def adapt_fewshot(base_ckpt,
 </code></pre>
 
 </details>
+
+<details>
+<summary>Best use cases (click to expand)</summary>
+
+<pre><code class="language-python">
+# Section 1 · Weather V1  ―  At-Home Solution (fully annotated)
+# “### ADD” marks every line / block that diverges from the organiser baseline.
+
+# Imports
+import math, random, datetime as dt
+from pathlib import Path, PurePath
+import torch, torch.nn as nn, torch.nn.functional as F
+import torch.utils.data as td
+from torch.cuda.amp import autocast, GradScaler
+
+# Config (baseline kept only bands/batch/device)
+CFG = dict(
+    bands      = 16,
+    batch      = 32,
+    epochs     = 30,           ### ADD  – baseline had 10
+    lr         = 5e-4,         ### ADD  – adamw instead of sgd 1e-3
+    device     = "cuda" if torch.cuda.is_available() else "cpu",
+    pos_weight = None,         ### ADD  – filled by calibrate_pos_weight()
+    focal_alpha= None,         ### ADD  – set alongside pos_weight
+    thr        = 0.4           ### ADD  – tuned Dice/Acc threshold
+)
+
+# ---------------------- dataset + metadata ----------------------
+def sun_elev(lat, lon, utc):
+    jd = utc.timetuple().tm_yday + utc.hour/24
+    decl = 23.44*math.cos(math.radians((jd+10)*360/365))
+    ha   = (utc.hour*15 + lon) - 180
+    elev = math.asin(
+        math.sin(math.radians(lat))*math.sin(math.radians(decl)) +
+        math.cos(math.radians(lat))*math.cos(math.radians(decl))*math.cos(math.radians(ha))
+    )
+    return math.sin(elev)      # −1 … 1
+
+def load_pt(p: Path):
+    t = torch.load(p)          # 17×H×W  (16 bands + mask)
+    x, y = t[:-1].float(), t[-1].long()
+    # metadata from filename “…_lat13.5_lon102.3_20250815T1710.pt”
+    lat = float(PurePath(p).stem.split("_lat")[1].split("_")[0])
+    lon = float(PurePath(p).stem.split("_lon")[1].split("_")[0])
+    utc = dt.datetime.strptime(PurePath(p).stem.split("_")[-1], "%Y%m%dT%H%M")
+    meta = torch.tensor([lat/90, lon/180, sun_elev(lat, lon, utc)], dtype=torch.float32)
+    return x, y, meta
+
+class SatDS(td.Dataset):
+    def __init__(self, root, split):
+        self.files = sorted(Path(root, split).glob("*.pt"))
+    def __len__(self): return len(self.files)
+    def __getitem__(self, i):  return load_pt(self.files[i])
+
+def collate(batch):
+    xs, ys, ms = zip(*batch)
+    xs, ys, ms = torch.stack(xs), torch.stack(ys), torch.stack(ms)
+    CFG["img_shape"] = xs.shape[-2:]
+    return xs, ys, ms
+
+def make_loader(root, split):
+    return td.DataLoader(SatDS(root, split),
+                         batch_size=CFG["batch"],
+                         shuffle=(split=="train"),
+                         collate_fn=collate)
+
+# -------------------------- augmentation ------------------------
+def random_band_drop(x, p=0.2):          ### ADD
+    if random.random() < p:
+        x[:, torch.randint(0, x.size(1), ())] = 0
+    return x
+def add_noise(x, σ=0.01): return x + σ*torch.randn_like(x)   ### ADD
+def hor_flip(x, y):
+    if random.random() < 0.5:
+        x = torch.flip(x, [-1]); y = torch.flip(y, [-1])
+    return x, y
+def aug(x, y):
+    x = random_band_drop(x); x = add_noise(x)
+    x, y = hor_flip(x, y)
+    return x, y
+
+# ------------------------ model ---------------------------------
+class ResBlock(nn.Module):               ### ADD (InstanceNorm + 2d-Dropout)
+    def __init__(self, c):
+        super().__init__()
+        self.n1 = nn.InstanceNorm2d(c); self.n2 = nn.InstanceNorm2d(c)
+        self.c1 = nn.Conv2d(c,c,3,1,1); self.c2 = nn.Conv2d(c,c,3,1,1)
+        self.drop, self.act = nn.Dropout2d(0.1), nn.SiLU()
+    def forward(self, x):
+        h = self.act(self.n1(x)); h = self.drop(self.c1(h))
+        h = self.act(self.n2(h)); h = self.c2(h)
+        return x + h
+
+class FiLM(nn.Module):                   ### ADD – scalar conditioning
+    def __init__(self, ch, cond=3, hid=64):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(cond,hid), nn.ReLU(),
+                                 nn.Linear(hid,ch*2))
+    def forward(self, f, meta):
+        γβ = self.mlp(meta); γ, β = γβ.chunk(2,1)
+        return f*(1+γ.view(-1,f.size(1),1,1)) + β.view(-1,f.size(1),1,1)
+
+class UNetV1(nn.Module):
+    def __init__(self, in_ch=16, use_attn=False):   ### use_attn reserved for CBAM
+        super().__init__()
+        self.stem = nn.Conv2d(in_ch,64,3,1,1)
+        self.d1 = nn.Conv2d(64,128,4,2,1); self.rb1=ResBlock(128)
+        self.d2 = nn.Conv2d(128,256,4,2,1); self.rb2=ResBlock(256)
+        self.d3 = nn.Conv2d(256,512,4,2,1); self.rb3=ResBlock(512)
+        self.mid = ResBlock(512)
+        self.film= FiLM(512,3)
+        self.u3 = nn.ConvTranspose2d(512,256,4,2,1)
+        self.u2 = nn.ConvTranspose2d(512,128,4,2,1)
+        self.u1 = nn.ConvTranspose2d(256,64,4,2,1)
+        self.out= nn.Conv2d(128,1,1)
+        self.cls = nn.Sequential(nn.AdaptiveAvgPool2d(1),
+                                 nn.Flatten(), nn.Linear(512,1))
+    def forward(self, x, meta):
+        s  = self.stem(x)
+        d1 = self.rb1(self.d1(s))
+        d2 = self.rb2(self.d2(d1))
+        d3 = self.rb3(self.d3(d2))
+        m  = self.film(self.mid(d3), meta)
+        u3 = self.u3(m)
+        u2 = self.u2(torch.cat([u3,d2],1))
+        u1 = self.u1(torch.cat([u2,d1],1))
+        mask = self.out(torch.cat([u1,s],1))
+        flag = self.cls(m).squeeze(1)
+        return mask, flag
+
+# -------------------- dynamic class weight + focal α ------------
+def calibrate_pos_weight(loader_tr):     ### ADD
+    fg, px = 0, 0
+    for _, y, _ in loader_tr:
+        fg += y.sum().item(); px += y.numel()
+    p = fg / px
+    CFG["pos_weight"] = (1-p)/p
+    CFG["focal_alpha"]= 1 - p            # FG weight in focal loss
+    print(f"class-imbalance p={p:.3%}  pos_w={CFG['pos_weight']:.4f}  α={CFG['focal_alpha']:.4f}")
+
+# --------------------------- losses ------------------------------
+class DiceLoss(nn.Module):
+    def forward(self, logit, y):
+        p = torch.sigmoid(logit)
+        inter = (p*y).sum(); union = p.sum()+y.sum()
+        return 1 - (2*inter+1)/(union+1)
+
+class FocalLoss(nn.Module):             ### ADD – uses calibrated α
+    def __init__(self, γ=2):
+        super().__init__(); self.γ=γ
+    def forward(self, logit, y):
+        α = CFG["focal_alpha"]
+        p  = torch.sigmoid(logit)
+        pt = p*y + (1-p)*(1-y)
+        w  = α*y + (1-α)*(1-y)
+        return (w*((1-pt)**self.γ)*(-pt.log())).mean()
+
+def active_contour(logit, y, λ=1, μ=1):
+    p = torch.sigmoid(logit)
+    dy, dx = torch.gradient(p, dim=(2,3))
+    length = torch.sqrt((dx**2+dy**2)+1e-8).mean()
+    region = (λ*((p-y)**2)*y + μ*((p-y)**2)*(1-y)).mean()
+    return length+region
+
+class WeatherLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dice = DiceLoss(); self.focal = FocalLoss()
+    def forward(self, mask_logit, img_logit, y):
+        flag = (y.sum((1,2))>0).float()
+        seg = 0.5*self.focal(mask_logit,y) + 0.3*self.dice(mask_logit,y) + \
+              0.2*active_contour(mask_logit,y)
+        img = F.binary_cross_entropy_with_logits(img_logit, flag)
+        return seg + 0.2*img
+
+# ------------------------ metric -------------------------------
+def dice_acc(mask_logit, img_logit, y, thr=CFG["thr"]):
+    dice = 1 - DiceLoss()(mask_logit, y)
+    pred_flag = (torch.sigmoid(img_logit)>0.5).long()
+    acc = (pred_flag == (y.sum((1,2))>0)).float().mean()
+    return 0.5*(dice+acc)
+
+# ------------------------ training -----------------------------
+def train(root):
+    tr = make_loader(root,"train")
+    calibrate_pos_weight(tr)            # sets pos_weight & α
+    va = make_loader(root,"val")
+    net=UNetV1(CFG["bands"]).to(CFG["device"])
+    opt=torch.optim.AdamW(net.parameters(), lr=CFG["lr"], weight_decay=1e-2)
+    sched=torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=CFG["lr"],
+                           total_steps=len(tr)*CFG["epochs"])
+    scaler, criterion = GradScaler(), WeatherLoss()
+    best = 0
+    for ep in range(CFG["epochs"]):
+        net.train()
+        for x,y,m in tr:
+            x,y,m = x.to(CFG["device"]),y.to(CFG["device"]),m.to(CFG["device"])
+            x,y = aug(x,y)
+            with autocast():
+                mask,flag = net(x,m)
+                loss = criterion(mask,flag,y)
+            scaler.scale(loss).backward()
+            scaler.step(opt); scaler.update(); opt.zero_grad(); sched.step()
+        net.eval(); vals=[]
+        with torch.no_grad(), autocast():
+            for x,y,m in va:
+                x,y,m = x.to(CFG["device"]),y.to(CFG["device"]),m.to(CFG["device"])
+                mask,flag = net(x,m)
+                vals.append(dice_acc(mask,flag,y))
+        val = torch.tensor(vals).mean().item()
+        if val>best: best=val; torch.save(net.state_dict(),"weather_best.pth")
+        print(f"ep{ep:02d} val {val:.4f}")
+
+# call training:
+# train("/path/to/weather_dataset")
+
+# Section 2 · Config + Loader + Meta-parser
+# This chunk covers S-0 and S-1 in one go.
+# Drop it at the top of your satellite notebook.
+
+import math, datetime as dt
+from pathlib import Path, PurePath
+import torch, torch.utils.data as td
+
+# ---------- CFG – edit once, everything downstream picks it up ----------
+CFG = dict(
+    # data-specific
+    bands       = 16,          # change if organiser adds/removes channels
+    img_shape   = None,        # auto-filled after first batch
+    use_meta    = True,        # lat/lon/UTC → sun-elev conditioning
+    metric_name = "dice_acc",  # default competition metric
+    # training hyper-params (overridden later if needed)
+    batch       = 32,
+    epochs      = 30,
+    lr          = 5e-4,
+    device      = "cuda" if torch.cuda.is_available() else "cpu",
+    # class-imbalance weights (filled by calibrate_pos_weight later)
+    pos_weight  = None,
+    focal_alpha = None,
+    thr         = 0.4          # initial mask threshold for Dice/Acc blend
+)
+
+# ---------- tiny helper: sun elevation normalised to −1 … 1 ----------
+def sun_elev(lat, lon, utc):
+    jd   = utc.timetuple().tm_yday + utc.hour / 24
+    decl = 23.44 * math.cos(math.radians((jd + 10) * 360 / 365))
+    ha   = (utc.hour * 15 + lon) - 180          # hour angle
+    elev = math.asin(
+        math.sin(math.radians(lat)) * math.sin(math.radians(decl)) +
+        math.cos(math.radians(lat)) * math.cos(math.radians(decl)) *
+        math.cos(math.radians(ha))
+    )
+    return math.sin(elev)                       # −1…1
+
+# ---------- file → (x, y, meta)  loader ----------------------------------
+def load_pt(f: Path):
+    """
+    Expects organiser .pt with 17×H×W tensor:
+        16 bands (float32) + 1 binary mask (int64)
+    Filename carries metadata:
+        “…_lat13.5_lon102.3_20250815T1710.pt”
+    Returns:
+        x : 16×H×W  float32   (NaNs replaced by 0)
+        y :    H×W  int64
+        m : 3-dim meta tensor  (lat, lon, sun-elev)
+    """
+    t   = torch.load(f)                         # shape 17×H×W
+    x   = t[:-1].float()
+    x[torch.isnan(x)] = 0                       # NaNs → 0  (handles band gaps)
+    y   = t[-1].long()
+
+    if CFG["use_meta"]:
+        lat = float(PurePath(f).stem.split("_lat")[1].split("_")[0])
+        lon = float(PurePath(f).stem.split("_lon")[1].split("_")[0])
+        utc = dt.datetime.strptime(PurePath(f).stem.split("_")[-1], "%Y%m%dT%H%M")
+        meta = torch.tensor([lat / 90, lon / 180, sun_elev(lat, lon, utc)],
+                            dtype=torch.float32)
+    else:
+        meta = torch.zeros(3)
+
+    return x, y, meta
+
+# ---------- torch Dataset / DataLoader -----------------------------------
+class SatDataset(td.Dataset):
+    def __init__(self, root, split):
+        self.files = sorted(Path(root, split).glob("*.pt"))
+    def __len__(self): return len(self.files)
+    def __getitem__(self, idx): return load_pt(self.files[idx])
+
+def collate_fn(batch):
+    xs, ys, ms = zip(*batch)
+    xs, ys, ms = torch.stack(xs), torch.stack(ys), torch.stack(ms)
+    # remember true image shape for dynamic padding later
+    CFG["img_shape"] = xs.shape[-2:]
+    return xs, ys, ms
+
+def make_loader(root, split):
+    """
+    root/
+      └── train/*.pt
+          val/*.pt
+    """
+    return td.DataLoader(SatDataset(root, split),
+                         batch_size=CFG["batch"],
+                         shuffle=(split == "train"),
+                         collate_fn=collate_fn)
+# Section 3 · Augmentation Bag (Spectral & Geometric)
+# Hook into training with:   x, y = apply_sat_aug(x, y)
+# Each aug is a plain function so you can reorder or comment out lines.
+
+import torch, random, torch.nn.functional as F
+
+# -------- band-level corruption ---------------------------------
+def random_band_drop(x, p=0.2):
+    """
+    Zero-out one spectral band with prob p.
+    Guards against real validation files where a VIS/IR channel is missing.
+    """
+    if random.random() < p:
+        band = torch.randint(0, x.size(1), ())
+        x[:, band] = 0
+    return x
+
+def gaussian_noise(x, sigma=0.01):
+    """
+    Additive Gaussian noise – covers sensor SNR shifts or compression artefacts.
+    """
+    return x + sigma * torch.randn_like(x)
+
+# -------- sample-level blending ---------------------------------
+def mixup(x, y, alpha=0.4):
+    """
+    MixUp for segmentation: convex combination of two images.
+    Only use when your loss can handle soft labels (e.g. BCE/Dice).
+    """
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    idx = torch.randperm(x.size(0))
+    x_mix = lam * x + (1 - lam) * x[idx]
+    # keep hard label of dominant sample for simplicity
+    y_mix = y if lam >= 0.5 else y[idx]
+    return x_mix, y_mix
+
+def cutmix_patch(x, y, alpha=1.0, max_prop=0.4):
+    """
+    CutMix – paste random patch from another image in the batch.
+    More aggressive than MixUp; good against over-fitting when train < val size.
+    """
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    B, C, H, W = x.size()
+    cut_w = int(W * max_prop * lam ** 0.5)
+    cut_h = int(H * max_prop * lam ** 0.5)
+    cx, cy = torch.randint(0, W, (1,)), torch.randint(0, H, (1,))
+    x1, y1 = max(cx - cut_w // 2, 0), max(cy - cut_h // 2, 0)
+    x2, y2 = min(cx + cut_w // 2, W), min(cy + cut_h // 2, H)
+    idx = torch.randperm(B)
+    x[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
+    y[:,   y1:y2, x1:x2] = y[idx,   y1:y2, x1:x2]
+    return x, y
+
+# -------- geometric invariance ---------------------------------
+def horizontal_flip(x, y):
+    """
+    Flip along longitude – valid because physical latitude order stays.
+    Disable if organiser’s task attaches absolute longitudes to classes!
+    """
+    if random.random() < 0.5:
+        x = torch.flip(x, [-1]); y = torch.flip(y, [-1])
+    return x, y
+
+# -------- master switchboard -----------------------------------
+def apply_sat_aug(x, y, *, use_mixup=False, use_cutmix=False):
+    """
+    Call inside training loop *before* sending to model.
+      x, y = apply_sat_aug(x, y)
+    Toggle MixUp / CutMix via kwargs.
+    """
+    x = random_band_drop(x)
+    x = gaussian_noise(x)
+    x, y = horizontal_flip(x, y)
+    if use_mixup:
+        x, y = mixup(x, y)
+    if use_cutmix:
+        x, y = cutmix_patch(x, y)
+    return x, y
+# Section 4 · Metadata Conditioning Blocks  (S-3)
+# Plug the returned module into your UNet bottleneck:
+#
+#     self.meta_mod = build_meta_block(feat_ch=512,
+#                                      mode="film",      # or "channel"
+#                                      cond_dim=3)       # length of meta vector
+#     ...
+#     feats = self.meta_mod(feats, meta_vec)
+#
+# Modes
+#   "film"     – FiLM γ/β modulation   (default, good for small scalar vectors)
+#   "channel"  – Channel attention     (sigmoid weights)   use when meta vector
+#                should softly gate each feature map.
+
+import torch, torch.nn as nn
+
+# ---------- core primitives ------------------------------------
+class FiLM(nn.Module):
+    """Feature-wise linear modulation: feats * (1+γ) + β."""
+    def __init__(self, feat_ch, cond_dim, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cond_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, feat_ch * 2)
+        )
+    def forward(self, feats, meta):
+        γβ = self.net(meta)               # B×2C
+        γ, β = γβ.chunk(2, dim=1)
+        γ = γ.view(-1, feats.size(1), 1, 1)
+        β = β.view(-1, feats.size(1), 1, 1)
+        return feats * (1 + γ) + β
+
+class ChannelAttention(nn.Module):
+    """Apply sigmoid gate per feature map: feats * σ(Meta→C)."""
+    def __init__(self, feat_ch, cond_dim, hidden=64):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(cond_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, feat_ch),  nn.Sigmoid()
+        )
+    def forward(self, feats, meta):
+        g = self.fc(meta).view(-1, feats.size(1), 1, 1)
+        return feats * g
+
+# ---------- factory helper ------------------------------------
+def build_meta_block(feat_ch, mode="film", cond_dim=3, hidden=64):
+    """
+    mode : "film" | "channel" | None
+    cond_dim : length of meta vector (e.g. 3 if [lat, lon, sun])
+    """
+    if mode is None or cond_dim == 0:
+        return nn.Identity()
+    if mode == "film":
+        return FiLM(feat_ch, cond_dim, hidden)
+    if mode == "channel":
+        return ChannelAttention(feat_ch, cond_dim, hidden)
+    raise ValueError(f"Unknown meta conditioning mode: {mode}")
+# How to use Inside your UNet bottleneck
+self.meta_mod = build_meta_block(feat_ch=512,
+                                 mode="film",      # or "channel", or None
+                                 cond_dim=meta.size(1))
+
+...
+feats = self.meta_mod(feats, meta)   # meta is B×cond_dim
+
+# Section 5 · Backbone — Residual UNet (InstanceNorm, Dropout2d, optional CBAM)
+# This is the *conventional, explicit* layer-by-layer version —
+# no loops, no dynamic padding, mirrors the style you used in Weather V1.
+
+import torch, torch.nn as nn
+
+# ------------------------------------------------------------
+# Optional CBAM attention  (channel- & spatial)
+# ------------------------------------------------------------
+class CBAM(nn.Module):
+    def __init__(self, ch, red=16, k=7):
+        super().__init__()
+        self.mlp  = nn.Sequential(nn.Linear(ch, ch // red), nn.ReLU(),
+                                  nn.Linear(ch // red, ch))
+        self.conv = nn.Conv2d(2, 1, k, padding=(k - 1) // 2)
+        self.sig  = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        att = self.mlp(x.mean((2, 3)).view(b, c)) + \
+              self.mlp(x.amax((2, 3)).view(b, c))
+        x   = x * self.sig(att).view(b, c, 1, 1)
+        spa = self.sig(self.conv(torch.cat([x.mean(1, True),
+                                            x.amax(1, True)], 1)))
+        return x * spa
+
+# ------------------------------------------------------------
+# Residual Conv Block:   IN → CONV → Drop2d → IN → CONV (+ res) → CBAM?
+# ------------------------------------------------------------
+class ResBlock(nn.Module):
+    def __init__(self, ch, dropout_p=0.1, use_attn=False):
+        super().__init__()
+        self.n1 = nn.InstanceNorm2d(ch)
+        self.n2 = nn.InstanceNorm2d(ch)
+        self.c1 = nn.Conv2d(ch, ch, 3, 1, 1)
+        self.c2 = nn.Conv2d(ch, ch, 3, 1, 1)
+        self.drop, self.act = nn.Dropout2d(dropout_p), nn.SiLU()
+        self.attn = CBAM(ch) if use_attn else nn.Identity()
+
+    def forward(self, x):
+        h = self.act(self.n1(x))
+        h = self.drop(self.c1(h))
+        h = self.act(self.n2(h))
+        h = self.c2(h)
+        return self.attn(x + h)
+
+# ------------------------------------------------------------
+# UNet-Res backbone, depth = 4 (handles up to 256 × 256 cleanly)
+#   • meta_block: any nn.Module(feats, meta)  (FiLM, channel-attn …)
+# ------------------------------------------------------------
+class UNetRes(nn.Module):
+    """
+    Args
+    ----
+    in_ch      : # input spectral bands (e.g. 16)
+    base       : # filters after stem (64 default)
+    dropout_p  : 2-D dropout prob inside every ResBlock
+    use_attn   : True → wrap each ResBlock with CBAM
+    meta_block : optional conditioning module; Identity if None
+    """
+    def __init__(self, in_ch, base=64,
+                 dropout_p=0.1, use_attn=False,
+                 meta_block=None):
+        super().__init__()
+        # Stem
+        self.stem = nn.Conv2d(in_ch, base, 3, 1, 1)
+
+        # Encoder
+        self.down1 = nn.Conv2d(base, base*2, 4, 2, 1)
+        self.rb1   = ResBlock(base*2, dropout_p, use_attn)
+
+        self.down2 = nn.Conv2d(base*2, base*4, 4, 2, 1)
+        self.rb2   = ResBlock(base*4, dropout_p, use_attn)
+
+        self.down3 = nn.Conv2d(base*4, base*8, 4, 2, 1)
+        self.rb3   = ResBlock(base*8, dropout_p, use_attn)
+
+        # Bottleneck
+        self.mid   = ResBlock(base*8, dropout_p, use_attn)
+        self.meta  = meta_block if meta_block is not None else nn.Identity()
+
+        # Decoder
+        self.up3   = nn.ConvTranspose2d(base*8, base*4, 4, 2, 1)
+        self.cv3   = nn.Conv2d(base*8, base*4, 3, 1, 1)
+
+        self.up2   = nn.ConvTranspose2d(base*4, base*2, 4, 2, 1)
+        self.cv2   = nn.Conv2d(base*4, base*2, 3, 1, 1)
+
+        self.up1   = nn.ConvTranspose2d(base*2, base,   4, 2, 1)
+        self.cv1   = nn.Conv2d(base*2, base,   3, 1, 1)
+
+        self.out_channels = base     # expose for head attachment
+        self.tail = nn.Conv2d(base*2, base, 3, 1, 1)   # concat stem skip later
+
+    def forward(self, x, meta=None):
+        s0 = self.stem(x)            # B × base × H × W
+
+        d1 = self.rb1(self.down1(s0))  # B × 2B × H/2
+        d2 = self.rb2(self.down2(d1))  # B × 4B × H/4
+        d3 = self.rb3(self.down3(d2))  # B × 8B × H/8
+
+        bott = self.meta(self.mid(d3), meta)            # apply FiLM if any
+
+        u3 = self.up3(bott)                             # H/4
+        u3 = self.cv3(torch.cat([u3, d2], 1))
+
+        u2 = self.up2(u3)                               # H/2
+        u2 = self.cv2(torch.cat([u2, d1], 1))
+
+        u1 = self.up1(u2)                               # H
+        u1 = self.cv1(torch.cat([u1, s0], 1))
+
+        feats = self.tail(torch.cat([u1, s0], 1))       # final feature map
+        return feats
+# Section 6 · Heads (S-5)
+# Attach exactly one of these heads to the backbone’s final feature map.
+#
+# Usage example
+# -------------
+#     feats = backbone(x, meta)           # B × C × H × W
+#     head   = build_head(feat_ch=backbone.out_channels,
+#                         head_type="binary",    # binary | multi | reg
+#                         num_classes=3)         # used for head_type="multi"
+#     logits = head(feats)
+#
+# Available head types
+#   • "binary"   – 1-channel sigmoid mask  (+ optional image-flag)
+#   • "multi"    – N-channel softmax mask
+#   • "reg"      – 1-channel rain-rate regression (mm h⁻¹)
+# If you need both pixel mask *and* image-flag, set `include_flag=True`.
+
+import torch, torch.nn as nn
+
+# ---------------- basic pixel heads ------------------------------------
+class BinaryMaskHead(nn.Module):
+    def __init__(self, in_ch): super().__init__(); self.conv = nn.Conv2d(in_ch, 1, 1)
+    def forward(self, feats):  return self.conv(feats)          # logits
+
+class MultiClassHead(nn.Module):
+    def __init__(self, in_ch, num_classes):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, num_classes, 1)
+    def forward(self, feats):  return self.conv(feats)          # logits
+
+class RegressionHead(nn.Module):
+    def __init__(self, in_ch): super().__init__(); self.conv = nn.Conv2d(in_ch, 1, 1)
+    def forward(self, feats):  return self.conv(feats)          # linear value
+
+# ---------------- optional image-level flag ----------------------------
+class ImageFlag(nn.Module):
+    """Global rain / no-rain flag via GAP + FC."""
+    def __init__(self, in_ch):
+        super().__init__()
+        self.cls = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_ch, 1)
+        )
+    def forward(self, feats):  return self.cls(feats).squeeze(1)
+
+# ---------------- factory helper --------------------------------------
+class HeadWrapper(nn.Module):
+    """
+    Returns a tuple:   (pixel_output, img_flag or None)
+    pixel_output shape:
+        binary, reg    → B×1×H×W
+        multi          → B×num_classes×H×W
+    """
+    def __init__(self, feat_ch, head_type="binary", num_classes=2,
+                 include_flag=False):
+        super().__init__()
+        if head_type == "binary":
+            self.pix = BinaryMaskHead(feat_ch)
+        elif head_type == "multi":
+            self.pix = MultiClassHead(feat_ch, num_classes)
+        elif head_type == "reg":
+            self.pix = RegressionHead(feat_ch)
+        else:
+            raise ValueError("head_type must be binary | multi | reg")
+
+        self.flag = ImageFlag(feat_ch) if include_flag else None
+
+    def forward(self, feats):
+        pixel = self.pix(feats)
+        fflag = self.flag(feats) if self.flag else None
+        return pixel, fflag
+
+def build_head(feat_ch, head_type="binary", num_classes=2, include_flag=True):
+    """
+    Convenience wrapper:
+        head = build_head(backbone.out_channels, "binary", include_flag=True)
+    """
+    return HeadWrapper(feat_ch, head_type, num_classes, include_flag)
+# Section 7 · Loss Bank & Mixer  (S-6)
+# Each loss takes logits + ground-truth mask (plus img_flag when needed).
+# Combine any subset with one line:
+#
+#   criterion = CombinedLoss(
+#       names   = ["focal", "dice", "contour", "flag_bce"],
+#       weights = [0.4,      0.3,    0.1,      0.2]   # auto-normalised
+#   )
+#
+# Dynamic foreground weight & focal α are read from CFG, set once by
+# `calibrate_pos_weight(loader_tr)` (see Section 2).
+
+import torch, torch.nn as nn, torch.nn.functional as F
+
+# ---------------- individual pixel losses ---------------------------------
+class DiceLoss(nn.Module):
+    def forward(self, logit, y):
+        p = torch.sigmoid(logit)
+        inter = (p*y).sum(); union = p.sum()+y.sum()
+        return 1 - (2*inter+1)/(union+1)
+
+class FocalLoss(nn.Module):
+    def __init__(self, γ=2):
+        super().__init__(); self.γ = γ
+    def forward(self, logit, y):
+        α = CFG["focal_alpha"]         # set by calibrate_pos_weight
+        p  = torch.sigmoid(logit)
+        pt = p*y + (1-p)*(1-y)
+        w  = α*y + (1-α)*(1-y)
+        return (w * (1-pt).pow(self.γ) * (-pt.log())).mean()
+
+def active_contour(logit, y, λ=1, μ=1):
+    p = torch.sigmoid(logit)
+    dy, dx = torch.gradient(p, dim=(2,3))
+    length = torch.sqrt((dx**2 + dy**2) + 1e-8).mean()
+    region = (λ*((p-y)**2)*y + μ*((p-y)**2)*(1-y)).mean()
+    return length + region
+
+class TverskyLoss(nn.Module):
+    def __init__(self, α=0.7, β=0.3):
+        super().__init__(); self.a, self.b = α, β
+    def forward(self, logit, y):
+        p = torch.sigmoid(logit)
+        tp = (p*y).sum(); fp = (p*(1-y)).sum(); fn = ((1-p)*y).sum()
+        return 1 - (tp + 1) / (tp + self.a*fp + self.b*fn + 1)
+
+# Lovász hinge surrogate for IoU (binary)
+def _lovasz_grad(gt_sorted):
+    gts = gt_sorted.sum()
+    inter = gts - gt_sorted.cumsum(0)
+    union = gts + (1 - gt_sorted).cumsum(0)
+    jaccard = 1. - inter / union
+    jaccard[1:] -= jaccard[:-1]
+    return jaccard
+
+def lovasz_binary_flat(logits, labels):
+    signs = 2. * labels.float() - 1.
+    errors = 1. - logits * signs
+    errors_sorted, perm = torch.sort(errors, descending=True)
+    gt_sorted = labels[perm]
+    grad = _lovasz_grad(gt_sorted)
+    return torch.dot(F.relu(errors_sorted), grad)
+
+class LovaszHinge(nn.Module):
+    def forward(self, logit, y):
+        return lovasz_binary_flat(logit.view(-1), y.view(-1))
+
+# image-level flag BCE
+class FlagBCE(nn.Module):
+    def forward(self, img_logit, y_mask):
+        flag = (y_mask.sum((1,2)) > 0).float()
+        return F.binary_cross_entropy_with_logits(img_logit, flag)
+
+# ---------------- registry -----------------------------------------------
+LOSS_BANK = {
+    "focal"    : FocalLoss,
+    "dice"     : DiceLoss,
+    "contour"  : lambda: active_contour,    # functional form
+    "tversky"  : TverskyLoss,
+    "lovasz"   : LovaszHinge,
+    "flag_bce" : FlagBCE
+}
+
+# ---------------- mixer ---------------------------------------------------
+class CombinedLoss(nn.Module):
+    """
+    names   : list of keys from LOSS_BANK.
+    weights : same length; will be re-normalised.
+    Example:
+        criterion = CombinedLoss(["focal","dice","flag_bce"],
+                                 [0.5,    0.3,   0.2])
+    """
+    def __init__(self, names, weights):
+        super().__init__()
+        assert len(names) == len(weights) and all(n in LOSS_BANK for n in names)
+        # convert weights → tensor & normalise
+        w = torch.tensor(weights, dtype=torch.float)
+        self.weights = (w / w.sum()).tolist()
+        # instantiate or keep callable
+        self.loss_fns = []
+        for n in names:
+            lf = LOSS_BANK[n]()
+            self.loss_fns.append(lf)
+
+    def forward(self, mask_logit, img_logit, y):
+        total = 0.
+        for w, fn in zip(self.weights, self.loss_fns):
+            if isinstance(fn, nn.Module):
+                # pixel-wise loss
+                loss = fn(mask_logit, y) if not isinstance(fn, FlagBCE) \
+                       else fn(img_logit, y)
+            else:
+                # functional contour loss
+                loss = fn(mask_logit, y)
+            total += w * loss
+        return total
+# Classic V1 mix  (Focal + Dice + Contour + Flag)
+crit = CombinedLoss(["focal","dice","contour","flag_bce"],
+                    [0.4,   0.3,  0.1,      0.2])
+
+# Metric flips to IoU only
+crit = CombinedLoss(["lovasz"], [1.0])
+
+# Heavy FP penalty scenario
+crit = CombinedLoss(["tversky","flag_bce"], [0.8, 0.2])
+# Section 8 · Training Engine  (build → train → validate → save best)
+# One entry-point:    train_sat(root_dir)
+# Flags live in CFG (optim, sched, epochs, grad_clip, etc.) so you flip
+# behaviour without rewriting the loop.
+
+import torch, torch.nn as nn, torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import (OneCycleLR, CosineAnnealingWarmRestarts,
+                                      ReduceLROnPlateau)
+
+# ------------ optimiser / scheduler builders -----------------------------
+def build_optimizer(model):
+    lr = CFG["lr"]; wd = 1e-2
+    return optim.AdamW(model.parameters(), lr, weight_decay=wd)  # good default
+
+def build_scheduler(opt, steps_per_epoch):
+    return OneCycleLR(opt, max_lr=CFG["lr"],
+                      total_steps=steps_per_epoch * CFG["epochs"])
+
+# ------------ training loop ----------------------------------------------
+def train_sat(root):
+    # 1) loaders
+    loader_tr = make_loader(root, "train")        # from Section 2
+    calibrate_pos_weight(loader_tr)               # sets pos_weight & focal α
+    loader_va = make_loader(root, "val")
+
+    # 2) build model = backbone + head
+    meta_mod  = build_meta_block(512, mode="film", cond_dim=3)           # Sec 4
+    backbone  = UNetRes(in_ch=CFG["bands"],
+                        dropout_p=0.1,
+                        use_attn=True,
+                        meta_block=meta_mod)                             # Sec 5
+    head      = build_head(backbone.out_channels,
+                           head_type="binary",
+                           include_flag=True)                            # Sec 6
+    model     = nn.Sequential(backbone, head)                            # simple wrap
+
+    model.to(CFG["device"])
+
+    # 3) loss, optim, sched, AMP scaler
+    criterion = CombinedLoss(["focal", "dice", "contour", "flag_bce"],
+                             [0.4,    0.3,   0.1,      0.2])             # Sec 6
+    opt    = build_optimizer(model)
+    sched  = build_scheduler(opt, len(loader_tr))
+    scaler = GradScaler()
+    best   = -1
+
+    # 4) training epochs
+    for ep in range(CFG["epochs"]):
+        model.train()
+        for x, y, meta in loader_tr:
+            x, y, meta = x.to(CFG["device"]), y.to(CFG["device"]), meta.to(CFG["device"])
+            x, y = apply_sat_aug(x, y)                                   # Sec 3
+
+            with autocast():
+                feats   = backbone(x, meta)
+                mask_lp, flag_lp = head(feats)
+                loss = criterion(mask_lp, flag_lp, y)
+
+            scaler.scale(loss).backward()
+            scaler.step(opt); scaler.update(); opt.zero_grad(); sched.step()
+
+        # ----- validation -----
+        val_score = evaluate(model, loader_va)                           # Sec 7
+        print(f"ep{ep:02d}  val {val_score:.4f}")
+
+        if val_score > best:
+            best = val_score
+            torch.save(model.state_dict(), "sat_best.pth")
+
+    # 5) sweep optimal threshold for Dice / IoU blends
+    sweep_threshold(model, loader_va, metric_name=CFG["metric_name"])    # Sec 7
+    print("Training done. Best val =", best, "  Model saved to sat_best.pth")
+
+# Example run:
+# train_sat("/path/to/satellite_dataset")
+# Section 9 · Inference + Test-Time Augmentation (S-9)
+# ----------------------------------------------------
+# One entry point ―  run_inference(test_root)
+#   • Loads sat_best.pth + best_thr.json
+#   • Optional horizontal flip TTA
+#   • Writes masks to test_root/preds/*.pt   1-byte per pixel (uint8)
+#
+# Adjust CFG["use_tta"] to False if you need speed.
+
+import json, torch, torch.nn.functional as F
+from pathlib import Path
+
+# -------- configuration flag --------
+CFG["use_tta"] = True      # set False to disable flip-ensemble
+
+# -------- rebuild model exactly as training --------
+def load_model():
+    meta_mod  = build_meta_block(512, mode="film", cond_dim=3)
+    backbone  = UNetRes(in_ch=CFG["bands"],
+                        dropout_p=0.1,
+                        use_attn=True,
+                        meta_block=meta_mod)
+    head      = build_head(backbone.out_channels,
+                           head_type="binary",
+                           include_flag=True)
+    model = nn.Sequential(backbone, head).to(CFG["device"])
+    model.load_state_dict(torch.load("sat_best.pth", map_location=CFG["device"]))
+    model.eval()
+    return model
+
+# -------- helper: flip TTA --------
+def _forward_tta(model, x, meta):
+    m1, f1 = model(x, meta)
+    if not CFG["use_tta"]: return m1, f1
+    x_flip = torch.flip(x, [-1])
+    m2, f2 = model(x_flip, meta)
+    m2 = torch.flip(m2, [-1])          # unflip
+    m = (m1 + m2) / 2
+    f = (f1 + f2) / 2
+    return m, f
+
+# -------- load threshold --------
+try:
+    _THR = json.load(open("best_thr.json"))["thr"]
+except FileNotFoundError:
+    _THR = CFG["thr"]
+
+# -------- main inference routine --------
+@torch.no_grad()
+def run_inference(root):
+    test_loader = make_loader(root, "test")      # uses collate_fn Section 2
+    model = load_model()
+
+    out_dir = Path(root, "preds"); out_dir.mkdir(exist_ok=True)
+    for idx, (x, _, meta) in enumerate(test_loader):
+        x, meta = x.to(CFG["device"]), meta.to(CFG["device"])
+        m_logit, _ = _forward_tta(model, x, meta)
+        masks = (torch.sigmoid(m_logit) > _THR).byte().cpu()   # uint8 0/1
+        for i, mask in enumerate(masks):
+            # save one file per sample   e.g. preds/idx_00012.pt
+            torch.save(mask.squeeze(0), out_dir / f"idx_{idx*CFG['batch']+i:05d}.pt")
+    print("Inference done. Masks saved to", out_dir)
+# Section 10 · Few-Shot Adapt Helper  (S-10)
+# -----------------------------------------------------------
+# Quickly fine-tune sat_best.pth on a tiny organiser-supplied
+# adaptation set (e.g. 10–50 images) and save adapted.pth.
+#
+# Key knobs
+#   • freeze_encoder : True → only decoder + head learn
+#   • epochs         : default 5  (fast)
+#   • lr             : default 3e-4 (lower than full training)
+#
+# Usage
+#   adapt_fewshot(adapt_root="adat_set",
+#                 base_ckpt="sat_best.pth",
+#                 out_ckpt="adapted.pth",
+#                 freeze_encoder=True)
+
+def adapt_fewshot(adapt_root,
+                  base_ckpt="sat_best.pth",
+                  out_ckpt="adapted.pth",
+                  freeze_encoder=True,
+                  epochs=5,
+                  lr=3e-4):
+
+    # ---------- loaders (reuse Section 2 make_loader) ----------
+    tr = make_loader(adapt_root, "train")
+    va = make_loader(adapt_root, "val")
+
+    # ---------- rebuild model & load base weights -------------
+    meta_mod = build_meta_block(512, mode="film", cond_dim=3)
+    backbone = UNetRes(in_ch=CFG["bands"],
+                       dropout_p=0.1,
+                       use_attn=True,
+                       meta_block=meta_mod)
+    head     = build_head(backbone.out_channels,
+                          head_type="binary",
+                          include_flag=True)
+    model = nn.Sequential(backbone, head).to(CFG["device"])
+    model.load_state_dict(torch.load(base_ckpt, map_location=CFG["device"]))
+
+    # freeze encoder if requested
+    if freeze_encoder:
+        for n, p in model.named_parameters():
+            if "down" in n or "stem" in n or "mid" in n:
+                p.requires_grad_(False)
+
+    # ---------- optimiser / sched ----------
+    opt   = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                              lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr,
+                                                total_steps=len(tr)*epochs)
+    scaler, criterion = GradScaler(), CombinedLoss(
+        ["focal","dice","flag_bce"], [0.5,0.3,0.2])
+
+    best = -1
+    for ep in range(epochs):
+        model.train()
+        for x, y, meta in tr:
+            x,y,meta = x.to(CFG["device"]),y.to(CFG["device"]),meta.to(CFG["device"])
+            x,y = apply_sat_aug(x,y, use_mixup=False, use_cutmix=False)  # light aug
+            with autocast():
+                feats = backbone(x, meta)
+                m_log, f_log = head(feats)
+                loss = criterion(m_log, f_log, y)
+            scaler.scale(loss).backward()
+            scaler.step(opt); scaler.update(); opt.zero_grad(); sched.step()
+
+        # val metric
+        val = evaluate(model, va)
+        print(f"[adapt] ep{ep}  val {val:.4f}")
+        if val > best:
+            best = val; torch.save(model.state_dict(), out_ckpt)
+
+    print("Few-shot adaptation done ➜", out_ckpt, "  best val =", best)
+
+</code></pre>
+
+</details>
